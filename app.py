@@ -2,295 +2,173 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime
 from scipy.optimize import curve_fit
 
-st.set_page_config(
-    page_title="Production Forecasting Tool",
-    page_icon="🛢️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Production Forecasting Tool", page_icon="🛢️", layout="wide")
 
-# Sidebar
 st.sidebar.title("🛢️ Production Forecasting Tool")
-st.sidebar.markdown("---")
-page = st.sidebar.radio("Navigate", ["Dashboard", "Upload Data", "Forecasting", "Type Curves", "Saved Results"])
-st.sidebar.markdown("---")
-st.sidebar.caption(f"User: Partha | {datetime.now().strftime('%d %b %Y')}")
+page = st.sidebar.radio("Navigate", ["Dashboard", "Upload Data", "Forecasting", "Future Events"])
 
-# Session state
 if 'df' not in st.session_state:
     st.session_state.df = None
+if 'events' not in st.session_state:
+    st.session_state.events = []
 
-# ==================== HELPER FUNCTIONS ====================
-def exponential_decline(t, qi, di):
+# ==================== HELPERS ====================
+def exp_decline(t, qi, di):
     return qi * np.exp(-di * t)
 
-def hyperbolic_decline(t, qi, di, b):
-    return qi / (1 + b * di * t) ** (1/b)
-
-def fit_decline(dates, rates, model='exponential'):
-    """Simple DCA fit"""
+def fit_base_decline(rates):
     t = np.arange(len(rates))
     rates = np.array(rates, dtype=float)
-    
-    # Remove zeros and negatives for fitting
     mask = rates > 0
-    if mask.sum() < 3:
-        return None, None, None
-    
-    t_fit = t[mask]
-    r_fit = rates[mask]
-    
-    try:
-        if model == 'exponential':
-            popt, _ = curve_fit(exponential_decline, t_fit, r_fit, 
-                              p0=[r_fit[0], 0.05], bounds=(0, [np.inf, 2]), maxfev=5000)
-            qi, di = popt
-            b = 0
-        else:  # hyperbolic
-            popt, _ = curve_fit(hyperbolic_decline, t_fit, r_fit,
-                              p0=[r_fit[0], 0.05, 0.5], 
-                              bounds=(0, [np.inf, 2, 2]), maxfev=5000)
-            qi, di, b = popt
-        return qi, di, b
-    except:
-        return None, None, None
-
-def generate_forecast(dates, rates, months_ahead=24, model='exponential'):
-    """Generate forecast"""
-    qi, di, b = fit_decline(dates, rates, model)
-    if qi is None:
+    if mask.sum() < 4:
         return None, None
-    
-    t_hist = np.arange(len(rates))
-    t_future = np.arange(len(rates), len(rates) + months_ahead)
-    
-    if model == 'exponential' or b == 0:
-        hist_fit = exponential_decline(t_hist, qi, di)
-        future = exponential_decline(t_future, qi, di)
-    else:
-        hist_fit = hyperbolic_decline(t_hist, qi, di, b)
-        future = hyperbolic_decline(t_future, qi, di, b)
-    
-    last_date = pd.to_datetime(dates.iloc[-1])
-    future_dates = [last_date + pd.DateOffset(months=i+1) for i in range(months_ahead)]
-    
-    return future_dates, future, hist_fit, qi, di, b
+    try:
+        popt, _ = curve_fit(exp_decline, t[mask], rates[mask],
+                          p0=[max(rates[mask]), 0.03], bounds=(0, [np.inf, 1]), maxfev=2000)
+        return float(popt[0]), float(popt[1])
+    except:
+        return None, None
 
-# ==================== DASHBOARD ====================
-if page == "Dashboard":
-    st.title("Dashboard")
-    if st.session_state.df is not None:
-        df = st.session_state.df
-        st.success(f"Data loaded: {len(df)} rows | {df['Field'].nunique()} fields")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Fields", df['Field'].nunique())
-        col2.metric("Date Range", f"{df['Date'].min().strftime('%b %Y')} – {df['Date'].max().strftime('%b %Y')}")
-        col3.metric("Total Oil (bbl)", f"{df['Oil_bbl'].sum():,.0f}")
-    else:
-        st.info("Please upload data from the Upload Data page.")
+def build_forecast(hist_dates, hist_rates, events, months=36):
+    qi, di = fit_base_decline(hist_rates)
+    if qi is None:
+        return None
+    
+    last_date = pd.to_datetime(hist_dates.iloc[-1])
+    future_dates = pd.date_range(last_date + pd.DateOffset(months=1), periods=months, freq='MS')
+    t = np.arange(len(hist_rates), len(hist_rates) + months)
+    base = exp_decline(t, qi, di)
+    
+    df_f = pd.DataFrame({'Date': future_dates, 'Base': base, 'Total': base.copy()})
+    
+    for ev in events:
+        start = pd.to_datetime(ev['start'])
+        if ev['type'] == 'New Well':
+            qi_w = ev['qi']
+            di_w = ev['di']
+            # Months since well start
+            months_on = ((df_f['Date'] - start).dt.days / 30.44).clip(lower=0)
+            well_rate = np.where(df_f['Date'] >= start, exp_decline(months_on, qi_w, di_w), 0)
+            df_f['Total'] += well_rate
+        
+        elif ev['type'] == 'Water Injection':
+            # Simple response: oil uplift proportional to injection (with lag)
+            inj_start = start
+            inj_rate = ev.get('inj_rate', 5000)  # bbl/month water
+            response_factor = ev.get('response', 0.08)  # oil bbl per water bbl
+            lag = ev.get('lag', 3)
+            
+            months_since = ((df_f['Date'] - inj_start).dt.days / 30.44)
+            active = months_since >= lag
+            # Ramp up injection effect over 6 months
+            ramp = np.clip((months_since - lag) / 6, 0, 1)
+            uplift = np.where(active, inj_rate * response_factor * ramp, 0)
+            df_f['Total'] += uplift
+    
+    return df_f, qi, di
 
-# ==================== UPLOAD DATA ====================
-elif page == "Upload Data":
+# ==================== UPLOAD ====================
+if page == "Upload Data":
     st.title("Upload Production Data")
+    st.markdown("**Required columns:** `Field`, `Date`, `Oil_bbl`")
+    f = st.file_uploader("Upload file", type=["xlsx", "csv"])
+    if f:
+        df = pd.read_excel(f) if str(f.name).endswith('xlsx') else pd.read_csv(f)
+        df.columns = df.columns.str.strip()
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        st.session_state.df = df.dropna(subset=['Date', 'Field'])
+        st.success(f"Loaded {len(df)} rows")
+        st.dataframe(df.head(8))
+
+# ==================== FUTURE EVENTS ====================
+elif page == "Future Events":
+    st.title("Future Development Plan")
     
-    with st.expander("📋 Required Data Format", expanded=True):
-        st.markdown("""
-        **Excel / CSV must contain these columns:**
-        
-        | Column Name | Required | Example | Description |
-        |-------------|----------|---------|-------------|
-        | `Field` | Yes | RAVVA | Field or Well name |
-        | `Date` | Yes | 2024-01-01 | Month start date |
-        | `Oil_bbl` | Yes | 252161 | Monthly oil production (barrels) |
-        | `Oil_MT` | Optional | 33796 | Monthly oil (metric tonnes) |
-        | `Associated_Gas_m3` | Optional | 6054304 | Associated gas (m³) |
-        | `NonAssociated_Gas_m3` | Optional | 0 | Non-associated gas (m³) |
-        
-        **Notes:**
-        - Date format: YYYY-MM-DD preferred
-        - Multiple fields can be in one file
-        - Minimum 6 months of data recommended for forecasting
-        """)
+    tab1, tab2 = st.tabs(["Add New Well", "Add Water Injection"])
     
-    uploaded_file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
+    with tab1:
+        st.subheader("New Well")
+        with st.form("new_well"):
+            c1, c2, c3 = st.columns(3)
+            start = c1.date_input("Production Start Date")
+            qi = c2.number_input("Initial Rate qi (bbl/month)", value=18000, step=1000)
+            di = c3.number_input("Decline Rate Di (monthly)", value=0.025, step=0.005, format="%.3f")
+            name = st.text_input("Well Name (optional)", value=f"Well-{len(st.session_state.events)+1}")
+            if st.form_submit_button("Add New Well"):
+                st.session_state.events.append({
+                    'type': 'New Well', 'name': name,
+                    'start': str(start), 'qi': qi, 'di': di
+                })
+                st.success(f"Added {name}")
     
-    if uploaded_file is not None:
-        try:
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
-            else:
-                df = pd.read_excel(uploaded_file)
-            
-            df.columns = df.columns.str.strip()
-            
-            if 'Date' in df.columns:
-                df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-            elif 'ACTIVITY_MONTH' in df.columns:
-                df['Date'] = pd.to_datetime(df['ACTIVITY_MONTH'], errors='coerce')
-                if 'FIELD_NAME' in df.columns:
-                    df = df.rename(columns={'FIELD_NAME': 'Field'})
-                if 'OIL_BBL' in df.columns:
-                    df = df.rename(columns={'OIL_BBL': 'Oil_bbl'})
-            
-            missing = []
-            if 'Field' not in df.columns: missing.append('Field')
-            if 'Date' not in df.columns: missing.append('Date')
-            if 'Oil_bbl' not in df.columns: missing.append('Oil_bbl')
-            
-            if missing:
-                st.error(f"Missing required columns: {', '.join(missing)}")
-            else:
-                st.session_state.df = df.dropna(subset=['Date', 'Field'])
-                st.success(f"File loaded successfully: {uploaded_file.name}")
-                st.dataframe(df.head(12), use_container_width=True)
-                if 'Field' in df.columns:
-                    st.write(f"**Fields found:** {', '.join(df['Field'].dropna().unique()[:8])}")
-        except Exception as e:
-            st.error(f"Error reading file: {e}")
+    with tab2:
+        st.subheader("Water Injection")
+        with st.form("water_inj"):
+            c1, c2, c3 = st.columns(3)
+            start = c1.date_input("Injection Start Date", key="inj_start")
+            inj_rate = c2.number_input("Injection Rate (bbl water/month)", value=30000, step=5000)
+            response = c3.number_input("Oil Response Factor", value=0.06, step=0.01, format="%.2f",
+                                     help="Expected oil bbl per bbl water injected")
+            lag = st.slider("Response Lag (months)", 1, 12, 4)
+            if st.form_submit_button("Add Water Injection"):
+                st.session_state.events.append({
+                    'type': 'Water Injection',
+                    'start': str(start),
+                    'inj_rate': inj_rate,
+                    'response': response,
+                    'lag': lag
+                })
+                st.success("Water injection plan added")
+    
+    if st.session_state.events:
+        st.subheader("Current Plan")
+        st.dataframe(pd.DataFrame(st.session_state.events), use_container_width=True)
+        if st.button("Clear All"):
+            st.session_state.events = []
+            st.rerun()
 
 # ==================== FORECASTING ====================
 elif page == "Forecasting":
-    st.title("Decline Curve Forecasting")
+    st.title("Forecast")
     
     if st.session_state.df is None:
-        st.warning("Please upload data first from the Upload Data page.")
+        st.warning("Upload data first")
     else:
-        df = st.session_state.df.copy()
+        df = st.session_state.df
+        field = st.selectbox("Select Field", sorted(df['Field'].unique()))
+        fdata = df[df['Field']==field].sort_values('Date')
         
-        col_left, col_center = st.columns([1, 2.2])
+        months = st.slider("Forecast Horizon (months)", 12, 72, 36)
         
-        with col_left:
-            st.subheader("Controls")
-            fields = sorted(df['Field'].dropna().unique())
-            selected_field = st.selectbox("Select Field", fields)
-            
-            field_data = df[df['Field'] == selected_field].sort_values('Date').reset_index(drop=True)
-            
-            st.write(f"**Records:** {len(field_data)}")
-            if len(field_data) > 0:
-                st.write(f"**From:** {field_data['Date'].min().strftime('%b %Y')}")
-                st.write(f"**To:** {field_data['Date'].max().strftime('%b %Y')}")
-            
-            model = st.selectbox("Decline Model", ["Exponential", "Hyperbolic"])
-            months_ahead = st.slider("Forecast Months Ahead", 6, 60, 24)
-            
-            if st.button("Generate Forecast", type="primary"):
-                st.session_state.do_forecast = True
-                st.session_state.selected_field = selected_field
-                st.session_state.model = model
-                st.session_state.months = months_ahead
+        if st.button("Run Forecast", type="primary"):
+            result = build_forecast(fdata['Date'], fdata['Oil_bbl'].fillna(0).values,
+                                  st.session_state.events, months)
+            if result:
+                fcast, qi, di = result
+                st.session_state.last_forecast = (fdata, fcast, field)
         
-        with col_center:
-            if st.session_state.get('do_forecast', False):
-                field = st.session_state.selected_field
-                field_data = df[df['Field'] == field].sort_values('Date').reset_index(drop=True)
-                
-                rates = field_data['Oil_bbl'].fillna(0).values
-                dates = field_data['Date']
-                
-                result = generate_forecast(dates, rates, 
-                                         months_ahead=st.session_state.months,
-                                         model=st.session_state.model.lower())
-                
-                if result[0] is None:
-                    st.error("Could not fit decline curve. Need more non-zero data points.")
-                else:
-                    future_dates, future_rates, hist_fit, qi, di, b = result
-                    
-                    fig = go.Figure()
-                    # Historical
-                    fig.add_trace(go.Scatter(
-                        x=dates, y=rates, mode='markers', name='Historical',
-                        marker=dict(size=6, color='#1f77b4')
-                    ))
-                    # Fitted
-                    fig.add_trace(go.Scatter(
-                        x=dates, y=hist_fit, mode='lines', name='Fitted',
-                        line=dict(color='orange', width=2)
-                    ))
-                    # Forecast
-                    fig.add_trace(go.Scatter(
-                        x=future_dates, y=future_rates, mode='lines', name='Forecast',
-                        line=dict(color='red', width=2, dash='dash')
-                    ))
-                    
-                    fig.update_layout(
-                        title=f"{field} — Oil Forecast ({st.session_state.model})",
-                        xaxis_title="Date",
-                        yaxis_title="Oil (bbl/month)",
-                        height=520,
-                        hovermode='x unified',
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02)
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Parameters
-                    st.subheader("Decline Parameters")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("qi (bbl/month)", f"{qi:,.0f}")
-                    c2.metric("Di (nominal)", f"{di:.4f}")
-                    if st.session_state.model == "Hyperbolic":
-                        c3.metric("b-factor", f"{b:.3f}")
-                    else:
-                        c3.metric("b-factor", "0 (Exponential)")
+        if 'last_forecast' in st.session_state:
+            fdata, fcast, field = st.session_state.last_forecast
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=fdata['Date'], y=fdata['Oil_bbl'],
+                                   mode='markers', name='Historical', marker=dict(size=5)))
+            fig.add_trace(go.Scatter(x=fcast['Date'], y=fcast['Base'],
+                                   mode='lines', name='Base Decline', line=dict(dash='dot', color='gray')))
+            fig.add_trace(go.Scatter(x=fcast['Date'], y=fcast['Total'],
+                                   mode='lines', name='With Development', line=dict(color='red', width=2.5)))
+            fig.update_layout(height=520, title=f"{field} — Forecast with FDP",
+                            yaxis_title="Oil (bbl/month)", hovermode='x unified')
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.caption(f"Base decline: qi ≈ {qi:,.0f} bbl/month, Di ≈ {di:.4f}")
 
-# ==================== TYPE CURVES ====================
-elif page == "Type Curves":
-    st.title("Type Curve Generation")
-    
-    if st.session_state.df is None:
-        st.warning("Please upload data first.")
+elif page == "Dashboard":
+    st.title("Dashboard")
+    if st.session_state.df is not None:
+        st.metric("Fields Loaded", st.session_state.df['Field'].nunique())
+        st.metric("Events Planned", len(st.session_state.events))
     else:
-        df = st.session_state.df.copy()
-        fields = sorted(df['Field'].dropna().unique())
-        
-        selected_fields = st.multiselect("Select Fields for Type Curve", fields, default=fields[:3] if len(fields)>=3 else fields)
-        
-        if st.button("Generate Type Curves", type="primary") and selected_fields:
-            # Normalize each field to start from peak or first point
-            all_curves = []
-            for f in selected_fields:
-                fdata = df[df['Field']==f].sort_values('Date')
-                rates = fdata['Oil_bbl'].fillna(0).values
-                if len(rates) < 6 or rates.max() == 0:
-                    continue
-                # Normalize by max rate
-                norm = rates / rates.max()
-                all_curves.append(norm[:36])  # first 36 months
-            
-            if len(all_curves) < 2:
-                st.error("Need at least 2 fields with sufficient data.")
-            else:
-                # Pad to same length
-                max_len = max(len(c) for c in all_curves)
-                padded = [np.pad(c, (0, max_len-len(c)), constant_values=np.nan) for c in all_curves]
-                arr = np.array(padded)
-                
-                p10 = np.nanpercentile(arr, 90, axis=0)  # higher is P10 in production
-                p50 = np.nanpercentile(arr, 50, axis=0)
-                p90 = np.nanpercentile(arr, 10, axis=0)
-                
-                months = np.arange(1, max_len+1)
-                
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=months, y=p10, name='P10', line=dict(color='green', width=2)))
-                fig.add_trace(go.Scatter(x=months, y=p50, name='P50', line=dict(color='blue', width=3)))
-                fig.add_trace(go.Scatter(x=months, y=p90, name='P90', line=dict(color='red', width=2)))
-                
-                fig.update_layout(
-                    title="Normalized Type Curves (P10 / P50 / P90)",
-                    xaxis_title="Months from Start",
-                    yaxis_title="Normalized Rate",
-                    height=500,
-                    hovermode='x unified'
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                st.caption(f"Based on {len(all_curves)} fields. Rates normalized to each field's maximum.")
-
-# ==================== SAVED RESULTS ====================
-elif page == "Saved Results":
-    st.title("Saved Forecasts")
-    st.info("Save and compare feature will be added in the next version.")
+        st.info("Upload production data to start")
