@@ -3,7 +3,6 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
 
-# Page config
 st.set_page_config(
     page_title="Production Forecasting Tool",
     page_icon="🛢️",
@@ -11,40 +10,61 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Sidebar Navigation
+# Sidebar
 st.sidebar.title("🛢️ Forecasting Tool")
 st.sidebar.markdown("---")
-
-page = st.sidebar.radio(
-    "Navigate",
-    ["Dashboard", "Upload Data", "Forecasting", "Type Curves", "Saved Results"]
-)
-
+page = st.sidebar.radio("Navigate", ["Dashboard", "Upload Data", "Forecasting", "Type Curves", "Saved Results"])
 st.sidebar.markdown("---")
 st.sidebar.caption(f"User: Partha | {datetime.now().strftime('%d %b %Y')}")
+
+# Session state
+if 'df' not in st.session_state:
+    st.session_state.df = None
 
 # ==================== DASHBOARD ====================
 if page == "Dashboard":
     st.title("Dashboard")
-    st.markdown("### Production Overview")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Wells", "128", "+4")
-    col2.metric("Active Wells", "96", "-2")
-    col3.metric("Last Month Oil (bbl)", "18,450", "+3.2%")
-    col4.metric("Last Month Gas (MMscf)", "245", "+1.8%")
-    
-    st.markdown("### Recent Activity")
-    st.info("No recent forecasts yet. Start by uploading data.")
+    if st.session_state.df is not None:
+        df = st.session_state.df
+        st.success(f"Data loaded: {len(df)} rows | {df['Field'].nunique()} fields")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Fields", df['Field'].nunique())
+        col2.metric("Date Range", f"{df['Date'].min().strftime('%b %Y')} – {df['Date'].max().strftime('%b %Y')}")
+        col3.metric("Total Oil (bbl)", f"{df['Oil_bbl'].sum():,.0f}")
+    else:
+        st.info("Pehle Upload Data page se file load karo.")
 
 # ==================== UPLOAD DATA ====================
 elif page == "Upload Data":
     st.title("Upload Production Data")
     
+    # Format instructions
+    with st.expander("📋 Required Data Format (Click to expand)", expanded=True):
+        st.markdown("""
+        **Excel / CSV mein yeh columns hone chahiye:**
+        
+        | Column Name | Required | Example | Description |
+        |-------------|----------|---------|-------------|
+        | `Field` | Yes | RAVVA | Field / Well name |
+        | `Date` | Yes | 2024-01-01 | Month start date (YYYY-MM-DD) |
+        | `Oil_bbl` | Yes | 252161 | Monthly oil production (barrels) |
+        | `Oil_MT` | Optional | 33796 | Monthly oil (metric tonnes) |
+        | `Associated_Gas_m3` | Optional | 6054304 | Associated gas (m³) |
+        | `NonAssociated_Gas_m3` | Optional | 0 | Non-associated gas (m³) |
+        
+        **Notes:**
+        - Date format: `YYYY-MM-DD` or `DD-MM-YYYY` dono chalega
+        - Numbers mein comma mat daalo
+        - Empty cells allowed hain (optional columns mein)
+        - Multiple fields ek hi file mein ho sakte hain
+        """)
+        
+        st.info("Sample file download karke dekh sakte ho format samajhne ke liye.")
+    
     uploaded_file = st.file_uploader(
-        "Upload Excel or CSV file",
+        "Upload Excel or CSV",
         type=["xlsx", "xls", "csv"],
-        help="Required columns: Well_Name, Date, Oil_Rate, Gas_Rate, Water_Rate"
+        help="Columns: Field, Date, Oil_bbl (minimum required)"
     )
     
     if uploaded_file is not None:
@@ -54,19 +74,37 @@ elif page == "Upload Data":
             else:
                 df = pd.read_excel(uploaded_file)
             
-            st.success("File uploaded successfully!")
-            st.subheader("Data Preview")
-            st.dataframe(df.head(20), use_container_width=True)
+            df.columns = df.columns.str.strip()
             
-            st.subheader("Column Mapping")
-            cols = df.columns.tolist()
-            c1, c2, c3 = st.columns(3)
-            well_col = c1.selectbox("Well Name", cols)
-            date_col = c2.selectbox("Date", cols)
-            oil_col = c3.selectbox("Oil Rate", cols)
+            # Flexible date handling
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True)
+            elif 'ACTIVITY_MONTH' in df.columns:
+                df['Date'] = pd.to_datetime(df['ACTIVITY_MONTH'], errors='coerce')
+                if 'FIELD_NAME' in df.columns:
+                    df = df.rename(columns={'FIELD_NAME': 'Field'})
+                if 'OIL_BBL' in df.columns:
+                    df = df.rename(columns={'OIL_BBL': 'Oil_bbl'})
             
-            if st.button("Save to Database", type="primary"):
-                st.success("Data saved successfully! (Placeholder)")
+            # Basic validation
+            missing = []
+            if 'Field' not in df.columns:
+                missing.append('Field')
+            if 'Date' not in df.columns:
+                missing.append('Date')
+            if 'Oil_bbl' not in df.columns and 'OIL_BBL' not in df.columns:
+                missing.append('Oil_bbl')
+            
+            if missing:
+                st.error(f"Missing required columns: {', '.join(missing)}")
+            else:
+                st.session_state.df = df
+                st.success(f"✅ File loaded successfully: {uploaded_file.name}")
+                st.subheader("Data Preview")
+                st.dataframe(df.head(15), use_container_width=True)
+                
+                if 'Field' in df.columns:
+                    st.write(f"**Fields found:** {', '.join(df['Field'].dropna().unique()[:10])}")
                 
         except Exception as e:
             st.error(f"Error reading file: {e}")
@@ -75,69 +113,65 @@ elif page == "Upload Data":
 elif page == "Forecasting":
     st.title("Decline Curve Forecasting")
     
-    col_left, col_center, col_right = st.columns([1, 2, 1])
-    
-    with col_left:
-        st.subheader("Controls")
-        wells = st.multiselect("Select Wells", ["Well-A1", "Well-B2", "Well-C3", "Well-D4"])
-        fluid = st.selectbox("Fluid", ["Oil", "Gas", "Water"])
-        model = st.selectbox("Decline Model", ["Exponential", "Hyperbolic", "Harmonic", "Multi-segment"])
+    if st.session_state.df is None:
+        st.warning("Pehle Upload Data page se file load karo.")
+    else:
+        df = st.session_state.df.copy()
         
-        st.markdown("**Manual Parameters**")
-        qi = st.number_input("qi (Initial Rate)", value=500.0)
-        di = st.number_input("Di (Decline Rate)", value=0.15, format="%.3f")
-        b = st.number_input("b-factor", value=0.8, min_value=0.0, max_value=2.0)
+        col_left, col_center = st.columns([1, 2])
         
-        if st.button("Auto Fit", type="primary"):
-            st.success("Auto-fit completed (Placeholder)")
+        with col_left:
+            st.subheader("Controls")
+            fields = sorted(df['Field'].dropna().unique())
+            selected_field = st.selectbox("Select Field", fields)
+            
+            field_data = df[df['Field'] == selected_field].sort_values('Date')
+            
+            st.write(f"**Records:** {len(field_data)}")
+            if len(field_data) > 0:
+                st.write(f"**From:** {field_data['Date'].min().strftime('%b %Y')}")
+                st.write(f"**To:** {field_data['Date'].max().strftime('%b %Y')}")
+            
+            available_cols = [c for c in ['Oil_bbl', 'Oil_MT', 'Associated_Gas_m3', 'NonAssociated_Gas_m3'] if c in field_data.columns]
+            fluid = st.selectbox("Plot", available_cols if available_cols else ['Oil_bbl'])
+            
+            if st.button("Show Chart", type="primary"):
+                st.session_state.show_chart = True
         
-        if st.button("Generate Forecast"):
-            st.session_state['forecast_ready'] = True
-    
-    with col_center:
-        st.subheader("Forecast Chart")
-        # Dummy chart
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=[1,2,3,4,5], y=[500,420,360,310,270], mode='markers', name='Historical'))
-        fig.add_trace(go.Scatter(x=[1,2,3,4,5,6,7,8], y=[500,420,360,310,270,235,205,180], mode='lines', name='Forecast'))
-        fig.update_layout(height=450, margin=dict(l=20,r=20,t=30,b=20))
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col_right:
-        st.subheader("Results")
-        st.metric("EUR", "1,245,000 bbl")
-        st.metric("Remaining", "385,000 bbl")
-        st.metric("End Date", "Mar 2032")
-        
-        if st.button("Save Forecast"):
-            st.success("Forecast saved!")
-        if st.button("Export Excel"):
-            st.info("Export feature coming soon")
+        with col_center:
+            if st.session_state.get('show_chart', False) and selected_field:
+                field_data = df[df['Field'] == selected_field].sort_values('Date')
+                y_col = fluid if fluid in field_data.columns else 'Oil_bbl'
+                
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=field_data['Date'],
+                    y=field_data[y_col],
+                    mode='lines+markers',
+                    name=selected_field,
+                    line=dict(width=2)
+                ))
+                fig.update_layout(
+                    title=f"{selected_field} — {y_col}",
+                    xaxis_title="Date",
+                    yaxis_title=y_col,
+                    height=500,
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.subheader("Quick Stats")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Max", f"{field_data[y_col].max():,.0f}")
+                c2.metric("Min", f"{field_data[y_col].min():,.0f}")
+                c3.metric("Latest", f"{field_data[y_col].iloc[-1]:,.0f}")
 
 # ==================== TYPE CURVES ====================
 elif page == "Type Curves":
     st.title("Type Curve Generation")
-    
-    c1, c2 = st.columns(2)
-    area = c1.selectbox("Select Area / Field", ["Field-A", "Field-B", "Block-X"])
-    fluid_tc = c2.selectbox("Fluid", ["Oil", "Gas"])
-    
-    st.subheader("P10 / P50 / P90 Type Curves")
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=list(range(1,25)), y=[1000/(i**0.3) for i in range(1,25)], name="P10"))
-    fig2.add_trace(go.Scatter(x=list(range(1,25)), y=[800/(i**0.4) for i in range(1,25)], name="P50"))
-    fig2.add_trace(go.Scatter(x=list(range(1,25)), y=[600/(i**0.5) for i in range(1,25)], name="P90"))
-    fig2.update_layout(height=500)
-    st.plotly_chart(fig2, use_container_width=True)
+    st.info("Coming in next version — multi-field comparison.")
 
 # ==================== SAVED RESULTS ====================
 elif page == "Saved Results":
     st.title("Saved Forecasts")
-    
-    data = {
-        "Well": ["Well-A1", "Well-B2", "Well-C3"],
-        "Date Saved": ["05 Nov 2026", "03 Nov 2026", "28 Oct 2026"],
-        "EUR": ["1.24 MMbbl", "0.87 MMbbl", "2.15 MMbbl"],
-        "Model": ["Hyperbolic", "Exponential", "Multi-segment"]
-    }
-    st.dataframe(pd.DataFrame(data), use_container_width=True)
+    st.info("Save feature will be added after DCA engine.")
